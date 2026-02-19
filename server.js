@@ -1,87 +1,80 @@
 // server.js
-// Simple WebSocket signalling server using `ws`
-// - sends `joined` to the joining client with current count
-// - notifies existing peers with `new-peer`
-// - relays `signal` messages (offer/answer/candidates)
-// - exposes a small HTTP landing page so visiting the URL doesn't return "Upgrade Required"
+// Socket.IO signalling server that:
+// - accepts 'join' events
+// - emits 'joined' to the joining client with count
+// - emits 'new-peer' to existing peers
+// - relays 'signal' events (offer/answer/candidates)
+// - serves a small HTTP landing page
 
-const http = require("http");
-const WebSocket = require("ws");
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 8080;
+const app = express();
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("WebSocket signalling server is running.\n");
+app.get('/', (req, res) => {
+  res.type('text').send('Socket.IO signalling server is running.');
 });
 
-const wss = new WebSocket.Server({ server });
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*' }
+});
 
-const rooms = {};
+const rooms = {}; // { roomId: [socketId, ...] }
 
-wss.on("connection", (ws) => {
-  ws.on("message", (message) => {
-    let data;
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+
+  socket.on('join', (payload) => {
     try {
-      data = JSON.parse(message);
-    } catch (e) {
-      console.error("Invalid JSON:", message);
-      return;
-    }
-
-    const { type, roomId } = data;
-
-    if (type === "join") {
+      const roomId = payload?.roomId;
       if (!roomId) return;
 
       if (!rooms[roomId]) rooms[roomId] = [];
 
       const peers = rooms[roomId];
-      const joiningClientCount = peers.length + 1;
+      const joiningCount = peers.length + 1;
 
-      // Inform the joining client how many peers are in the room now
-      ws.send(JSON.stringify({ type: "joined", roomId, count: joiningClientCount }));
+      // Add socket to room (server-side tracking)
+      rooms[roomId].push(socket.id);
+      socket.join(roomId);
+      socket.roomId = roomId;
+
+      // Send joined info to the joining client
+      socket.emit('joined', { roomId, count: joiningCount });
+      console.log(`Socket ${socket.id} joined ${roomId} (count=${joiningCount})`);
 
       // Notify existing peers that a new peer joined
-      peers.forEach((peer) => {
-        if (peer.readyState === WebSocket.OPEN) {
-          peer.send(JSON.stringify({ type: "new-peer", roomId }));
-        }
-      });
-
-      // Add the new client to the room
-      rooms[roomId].push(ws);
-      ws.roomId = roomId;
-
-      console.log(`User joined room ${roomId}, count=${joiningClientCount}`);
-      return;
-    }
-
-    if (type === "signal") {
-      // Relay signalling messages to all peers in the room
-      if (!roomId) return;
-      const peers = rooms[roomId] || [];
-      peers.forEach((peer) => {
-        if (peer !== ws && peer.readyState === WebSocket.OPEN) {
-          peer.send(JSON.stringify(data));
-        }
-      });
-      return;
+      socket.to(roomId).emit('new-peer', { roomId, newPeerId: socket.id });
+    } catch (e) {
+      console.error('join handler error', e);
     }
   });
 
-  ws.on("close", () => {
-    const roomId = ws.roomId;
+  socket.on('signal', (payload) => {
+    try {
+      const roomId = payload?.roomId;
+      if (!roomId) return;
+      // Relay the signal to all other sockets in the room
+      socket.to(roomId).emit('signal', payload);
+    } catch (e) {
+      console.error('signal handler error', e);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    const roomId = socket.roomId;
+    console.log('Client disconnected:', socket.id);
     if (roomId && rooms[roomId]) {
-      rooms[roomId] = rooms[roomId].filter((client) => client !== ws);
-      console.log(`User left room ${roomId}, remaining=${rooms[roomId].length}`);
-      if (rooms[roomId].length === 0) {
-        delete rooms[roomId];
-      }
+      rooms[roomId] = rooms[roomId].filter((id) => id !== socket.id);
+      socket.to(roomId).emit('peer-left', { roomId, peerId: socket.id });
+      if (rooms[roomId].length === 0) delete rooms[roomId];
     }
   });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server listening on port ${PORT}`);
 });
